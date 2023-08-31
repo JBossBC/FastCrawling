@@ -19,3 +19,11 @@
 
 # Go workspace file
 go.work
+
+logo.ico
+
+resource.rc
+
+resource.res
+
+resource.syso
