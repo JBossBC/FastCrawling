@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +31,7 @@ import (
 
 // //go:embed resource.res
 // var resourceData string
+// var defaultBuildConnTimeout = 5 * time.Second
 
 const maxToleranceTimesForNetwork = 25
 
@@ -262,6 +264,7 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 			} else {
 				time.Sleep(smoothRequest)
 			}
+			// r.Request.Retry()
 			//recover tremble records
 			atomic.StoreInt32(&repliteController.contentTremble.AppearTime, 0)
 		}
@@ -270,6 +273,7 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 		err := r.Save(fmt.Sprintf("%s%c%s", repliteController.params.TargetDictLoc, os.PathSeparator, id))
 		if err != nil {
 			repliteController.finalizeSignal <- fmt.Errorf("持久化文件出错%s", err.Error())
+			return
 		}
 		repliteController.mapRWMutex.Lock()
 		defer repliteController.mapRWMutex.Unlock()
@@ -284,11 +288,15 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 func (repliteController *controller) retryConn() {
 	atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1)
 	if repliteController.params.HasProxy {
+
 		renewSocks5, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", repliteController.params.Ip, repliteController.params.Port), &proxy.Auth{User: repliteController.params.Username, Password: repliteController.params.Password}, proxy.Direct)
 		if err != nil {
 			repliteController.finalizeSignal <- fmt.Errorf("socks5代理服务器连接错误:%s", err.Error())
 		}
-		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false}
+		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false, DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,  // 设置建立连接的超时时间
+			KeepAlive: 30 * time.Second, // 设置保持连接的时间
+		}).DialContext}
 		repliteController.c.WithTransport(&transport)
 	}
 	//TODO if hasnt the proxy,how to repair this question
@@ -458,7 +466,7 @@ func main() {
 	// create the request and  send to colly.collector to execute
 	controller.executeRepliteChain()
 	// force enter wait
-	controller.c.Wait()
+	// controller.c.Wait()
 	controller.finish = true
 	controller.finalizer()
 	controller.releaseUnless()
@@ -468,11 +476,21 @@ func main() {
 func (repliteController *controller) finalizer() {
 	fmt.Println("---------正在扫描全部response是否符合预期------")
 	fileHeap := make(PriorityQueue, 0)
+	var allMap = make(map[string]*VariableParams)
+	var ExistsInt = make(map[int64]any, len(allMap))
+	allParamsfileStr := fmt.Sprintf("%s%c%s%c%s", repliteController.params.TargetDictLoc, os.PathSeparator, ".replite", os.PathSeparator, "allTaskVar.json")
+	file, err := os.Open(allParamsfileStr)
+	if err != nil {
+		panic(fmt.Sprintf("打开持久化的所有可变参数文件%s失败:%s", allParamsfileStr, err.Error()))
+	}
+	json.NewDecoder(file).Decode(&allMap)
+	var renewParams = make(map[string]*VariableParams)
 	filepath.Walk(repliteController.params.TargetDictLoc, func(path string, info fs.FileInfo, err error) error {
 		if info.IsDir() {
 			return nil
 		}
-		if _, err := strconv.ParseInt(info.Name(), 10, 64); err != nil {
+		var fileInt int64
+		if fileInt, err = strconv.ParseInt(info.Name(), 10, 64); err != nil {
 			fmt.Printf("忽略文件%s\n", info.Name())
 			return nil
 		}
@@ -480,9 +498,25 @@ func (repliteController *controller) finalizer() {
 			priority: int(info.Size()),
 			value:    info.Name(),
 		}
+		ExistsInt[fileInt] = nil
 		fileHeap = append(fileHeap, cur)
 		return nil
 	})
+	//TODO struct add the field to ignore this circul
+	var begin int64 = math.MaxInt64
+	for key, _ := range allMap {
+		keyInt, _ := strconv.ParseInt(key, 10, 64)
+		if keyInt < begin {
+			begin = keyInt
+		}
+	}
+	for i := int(begin); i < len(allMap); i++ {
+		if _, ok := ExistsInt[int64(i)]; !ok {
+			renewParams[strconv.FormatInt(int64(i), 10)] = allMap[strconv.FormatInt(int64(i), 10)]
+		}
+	}
+	fmt.Println("检测到未爬取的文件有:")
+	printRenewFiles(&renewParams)
 	heap.Init(&fileHeap)
 	// minFileSize, err := strconv.ParseInt(fileHeap[0].priority, 10, 64)
 	// if err != nil {
@@ -499,24 +533,22 @@ func (repliteController *controller) finalizer() {
 		return
 	}
 	var errorOffset = int(float64((fileHeap[0].priority + fileHeap[len(fileHeap)-1].priority)) / trembleOffsetTime)
-	fmt.Printf("判断错误的文件大小在%d以内,是否需要更改:(true or false)\n", errorOffset)
+	fmt.Printf("继续判断错误的文件大小在%d以内,是否需要更改:(true or false)\n", errorOffset)
 	var operate string
 	fmt.Scanln(&operate)
 	if strings.ToLower(operate) == "true" {
 		fmt.Print("请输入实际错误文件的大小为0-")
-		fmt.Scanf("%d", &errorOffset)
+		_, err = fmt.Scanln(&errorOffset)
+		if err != nil {
+			panic("请输入数字")
+		}
 	}
 	var flag bool = true
-	var allMap = make(map[string]*VariableParams)
-	allParamsfileStr := fmt.Sprintf("%s%c%s%c%s", repliteController.params.TargetDictLoc, os.PathSeparator, ".replite", os.PathSeparator, "allTaskVar.json")
-	file, err := os.Open(allParamsfileStr)
-	if err != nil {
-		panic(fmt.Sprintf("打开持久化的所有可变参数文件%s失败:%s", allParamsfileStr, err.Error()))
-	}
-	json.NewDecoder(file).Decode(&allMap)
-	var renewParams = make(map[string]*VariableParams)
 	for flag {
 		fInfo := heap.Pop(&fileHeap).(*FItem)
+		if fInfo == nil {
+			break
+		}
 		// itemStr := fInfo.value
 		// item, err := strconv.ParseInt(itemStr, 10, 64)
 		if err != nil {
@@ -528,14 +560,15 @@ func (repliteController *controller) finalizer() {
 			flag = false
 		}
 	}
+	fmt.Println("检测到需要恢复的全部文件:")
 	printRenewFiles(&renewParams)
+	fmt.Println("总共需要修复的文件数量:", len(renewParams))
 	repliteController.taskSignalMap = renewParams
 	fmt.Println("----------正在恢复错误的文件-----------")
 	repliteController.handleChain.handle(repliteController)
 }
 
 func printRenewFiles(params *map[string]*VariableParams) {
-	fmt.Println("检测到错误的文件有:")
 	var curNumber = 0
 	for key, _ := range *params {
 		fmt.Printf("%6s", key)
@@ -851,7 +884,7 @@ type fixupChain struct {
 }
 
 func (fixup *fixupChain) handle(repliteController *controller) {
-	if !(repliteController.params.Fixup != "" || (repliteController.finish && repliteController.params.Fixup == "")) {
+	if !(repliteController.params.Fixup != "" || repliteController.finish) {
 		fixup.next.handle(repliteController)
 		return
 	}
@@ -913,6 +946,10 @@ func (fixup *fixupChain) handle(repliteController *controller) {
 	}
 	begin := make(chan struct{}, 1)
 	once := sync.Once{}
+	var needRun bool = false
+	if len(repliteController.taskSignalMap) > 0 {
+		needRun = true
+	}
 	for _, value := range repliteController.taskSignalMap {
 		go func(value *VariableParams) {
 		recoverRequest:
@@ -948,7 +985,10 @@ func (fixup *fixupChain) handle(repliteController *controller) {
 		}(value)
 		time.Sleep(smoothRequest)
 	}
-	<-begin
+	if needRun {
+		<-begin
+	}
+	repliteController.c.Wait()
 }
 
 type pageChain struct {
@@ -976,8 +1016,12 @@ func (page *pageChain) handle(repliteController *controller) {
 	if repliteController.params.Fixup == "" {
 		repliteController.keepTaskVar()
 	}
+	var needRun bool = false
 	// reset curFrom
 	curForm = repliteController.params.From
+	if curForm <= repliteController.params.To {
+		needRun = true
+	}
 	for curForm <= repliteController.params.To {
 		go func(from int) {
 			fromVar := strconv.FormatInt(int64(from), 10)
@@ -1019,7 +1063,10 @@ func (page *pageChain) handle(repliteController *controller) {
 	}
 	// ensure the go func(){} starting be executed
 	// time.Sleep(2 * time.Millisecond)
-	<-begin
+	if needRun {
+		<-begin
+	}
+	repliteController.c.Wait()
 }
 
 type listChain struct {
@@ -1057,6 +1104,10 @@ func (list *listChain) handle(repliteController *controller) {
 	//to keep all params defend the error situation,when first execute
 	if repliteController.params.Fixup == "" {
 		repliteController.keepTaskVar()
+	}
+	var needRun bool = false
+	if i < len(lines) {
+		needRun = true
 	}
 	for i < len(lines) {
 		// time.Sleep(time.Millisecond)
@@ -1096,7 +1147,10 @@ func (list *listChain) handle(repliteController *controller) {
 		i++
 	}
 	// ensure the go func(){} starting be executed
-	<-begin
+	if needRun {
+		<-begin
+	}
+	repliteController.c.Wait()
 
 }
 
