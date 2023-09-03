@@ -33,11 +33,11 @@ import (
 // var resourceData string
 // var defaultBuildConnTimeout = 5 * time.Second
 
-const maxToleranceTimesForNetwork = 25
+const maxToleranceTimesForNetwork = 30
 
 const defualtRequestTimeout = 10 * time.Hour
 
-const defaultSocksRecoverTime = 100 * time.Millisecond
+const defaultSocksRecoverTime = 5 * time.Second
 
 const smoothRequest = 15 * time.Millisecond
 
@@ -113,6 +113,7 @@ type controller struct {
 	finish         bool
 	cookieChange   int32
 	stdMutex       *sync.RWMutex
+	failedChan     *sync.RWMutex
 	// once           *sync.Once
 }
 
@@ -199,6 +200,12 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrUnexpectedEOF) {
 			repliteController.retryConn()
 			r.Request.Retry()
+			return
+		}
+		if strings.Contains(err.Error(), "the connected party did not properly respond after a period of time") || strings.Contains(err.Error(), " connected host has failed to respond") {
+			repliteController.retryConn()
+			r.Request.Retry()
+			return
 		}
 		if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
 			repliteController.finalizeSignal <- fmt.Errorf("因网络原因导致重新建立连接多次,建议检查后台是否在线和所设线程的数量,防止被后台检测到和网络拥塞造成代理服务器崩溃:%s", err.Error())
@@ -219,6 +226,10 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 			r.Request.Retry()
 			return
 		}
+		if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
+			repliteController.finalizeSignal <- errors.New("因网络原因导致重新建立连接多次,建议检查后台是否在线和所设线程的数量,防止被后台检测到和网络拥塞造成代理服务器崩溃")
+			return
+		}
 		// if r.StatusCode != 200 {
 		// maybe is proxy error
 		// if repliteController.proxyStatus {
@@ -237,29 +248,32 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 		id := r.Request.Ctx.Get("id")
 
 		//TODO tremable inspect
+		//TODO if the cookie be recoverd need to execute ,but the proxy conn acquire the mutex  cause the cookieRecover cant execute
 		if repliteController.checkTremble(len(r.Body)) {
+			//release the CAS requestMutex  pressure,and upgrade the mutex granularity
 			if atomic.CompareAndSwapInt32(&repliteController.cookieChange, 0, 1) {
-				repliteController.stdMutex.Lock()
-				fmt.Printf("当前response size变动较大,可能是cookie过期,请检查%s文件\n", id)
-				fmt.Println("是否要退出程序:(true or false)")
-				var exitFlag string
-				fmt.Scanln(&exitFlag)
-				if strings.ToLower(exitFlag) == "true" {
-					repliteController.finalizeSignal <- errors.New("自愿退出程序")
-
-				}
-				fmt.Println("是否需要改变cookie:(true or false):")
-				var flag string
-				fmt.Scanln(&flag)
-				repliteController.stdMutex.Unlock()
-				if strings.ToLower(flag) == "true" {
-					repliteController.cookieRecover(r)
-					r.Request.Retry()
-					return
-				} else {
-					//update the tremble factor
-					repliteController.contentTremble.MinToleranceLength = repliteController.contentTremble.CurTrembleValue
-				}
+				//the cookie recover operate should be consider as the first task of executing,so the requestMutex will be CAS  util the cookieRecover obtains the mutex to recover
+				repliteController.cookieRecover(r)
+				// repliteController.stdMutex.Lock()
+				// fmt.Printf("当前response size变动较大,可能是cookie过期,请检查%s文件\n", id)
+				// fmt.Println("是否要退出程序:(true or false)")
+				// var exitFlag string
+				// fmt.Scanln(&exitFlag)
+				// if strings.ToLower(exitFlag) == "true" {
+				// 	repliteController.finalizeSignal <- errors.New("自愿退出程序")
+				// }
+				// fmt.Println("是否需要改变cookie:(true or false):")
+				// var flag string
+				// fmt.Scanln(&flag)
+				// repliteController.stdMutex.Unlock()
+				// if strings.ToLower(flag) == "true" {
+				// 	repliteController.cookieRecover(r)
+				// 	r.Request.Retry()
+				// 	return
+				// } else {
+				// 	//update the tremble factor
+				// 	repliteController.contentTremble.MinToleranceLength = repliteController.contentTremble.CurTrembleValue
+				// }
 				atomic.CompareAndSwapInt32(&repliteController.cookieChange, 1, 0)
 			} else {
 				time.Sleep(smoothRequest)
@@ -286,17 +300,19 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 }
 
 func (repliteController *controller) retryConn() {
-	atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1)
+	// In current high concurrent system,the retryConn operate should be consider as the frequently,comparing as the cookieRecover, so  'if CAS' operate  has same as effect for cookieRecover 'for CAS'
+	// but It is worth noting that  the cookieRecover priority should higher than the retryConn in actual situation, that's also why the author designed it this way
+	if !atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
+		return
+	}
+	fmt.Println("正在重连代理服务器")
+	time.Sleep(defaultSocksRecoverTime)
 	if repliteController.params.HasProxy {
-
 		renewSocks5, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", repliteController.params.Ip, repliteController.params.Port), &proxy.Auth{User: repliteController.params.Username, Password: repliteController.params.Password}, proxy.Direct)
 		if err != nil {
 			repliteController.finalizeSignal <- fmt.Errorf("socks5代理服务器连接错误:%s", err.Error())
 		}
-		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false, DialContext: (&net.Dialer{
-			Timeout:   5 * time.Second,  // 设置建立连接的超时时间
-			KeepAlive: 30 * time.Second, // 设置保持连接的时间
-		}).DialContext}
+		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false}
 		repliteController.c.WithTransport(&transport)
 	}
 	//TODO if hasnt the proxy,how to repair this question
@@ -317,7 +333,47 @@ func (repliteController *controller) checkTremble(size int) bool {
 }
 func (repliteController *controller) cookieRecover(r *colly.Response) {
 	atomic.AddInt32(&repliteController.opTolerance, 1)
-	atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1)
+	for atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
+		break
+	}
+	repliteController.stdMutex.Lock()
+	defer repliteController.stdMutex.Unlock()
+	id := r.Request.Ctx.Get("id")
+	fmt.Printf("当前response size变动较大,可能是cookie过期,请检查%s文件\n", id)
+	nextSingal := make(chan any, 0)
+	go func(nextChan chan any) {
+		once := sync.Once{}
+		timer := time.NewTimer(1 * time.Minute)
+		for {
+			select {
+			case <-timer.C:
+				repliteController.finalizeSignal <- errors.New("自愿退出程序")
+			default:
+				once.Do(func() {
+					fmt.Println("是否要退出程序:(true or false)")
+					var exitFlag string = "true"
+					fmt.Scanln(&exitFlag)
+					if strings.ToLower(exitFlag) == "true" {
+						repliteController.finalizeSignal <- errors.New("自愿退出程序")
+					} else {
+						//can pass
+						nextChan <- struct{}{}
+					}
+				})
+			}
+		}
+	}(nextSingal)
+	<-nextSingal
+	fmt.Println("是否需要改变cookie:(true or false):")
+	var flag string
+	fmt.Scanln(&flag)
+	if strings.ToLower(flag) == "true" {
+		r.Request.Retry()
+	} else {
+		//update the tremble factor
+		repliteController.contentTremble.MinToleranceLength = repliteController.contentTremble.CurTrembleValue
+		return
+	}
 	// give a chance to require
 	var newCookies = make([]*http.Cookie, 0, len(repliteController.unlessRequest.Cookies()))
 	curCookie := r.Request.Headers.Get("Cookie")
@@ -378,11 +434,11 @@ func (repliteController *controller) recoverPersistence() {
 	// keep the uncomplete variable params to file
 	repliteController.mapRWMutex.Lock()
 	defer repliteController.mapRWMutex.Unlock()
-	uncompleteBys, err := json.Marshal(repliteController.taskSignalMap)
+	unfinishFile, err := os.OpenFile(fmt.Sprintf("%s%c%s", targetDict, os.PathSeparator, "unfinish.json"), os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		panic(fmt.Sprintf("持久化未爬取的数据时发生未知错误:%s", err.Error()))
 	}
-	unfinishFile, err := os.OpenFile(fmt.Sprintf("%s%c%s", targetDict, os.PathSeparator, "unfinish.json"), os.O_CREATE|os.O_TRUNC, 0644)
+	uncompleteBys, err := json.Marshal(repliteController.taskSignalMap)
 	if err != nil {
 		panic(fmt.Sprintf("持久化未爬取的数据时发生未知错误:%s", err.Error()))
 	}
@@ -545,6 +601,9 @@ func (repliteController *controller) finalizer() {
 	}
 	var flag bool = true
 	for flag {
+		if len(fileHeap) <= 0 {
+			break
+		}
 		fInfo := heap.Pop(&fileHeap).(*FItem)
 		if fInfo == nil {
 			break
@@ -718,11 +777,23 @@ func (repliteController *controller) releaseUnless() {
 	// }
 	repliteController.mapRWMutex.RLock()
 	defer repliteController.mapRWMutex.RUnlock()
+	unfinishStr := fmt.Sprintf("%s%c%s", curDict, os.PathSeparator, "unfinish.json")
 	if len(repliteController.taskSignalMap) == 0 {
 		//only delete the unfinish file
-		os.Remove(fmt.Sprintf("%s%c%s", curDict, os.PathSeparator, "unfinish.json"))
+		os.Remove(unfinishStr)
 		endTime := time.Now()
 		fmt.Printf("本次总共耗时:%s", (endTime.Sub(repliteController.metrics.NowStartTime) + repliteController.metrics.ConsistentTime).String())
+	} else {
+		// is panic , recover the unfinish file,passing the fixup function to fix
+		file, err := os.OpenFile(unfinishStr, os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("持久化unfinish.json文件出错:%s", err.Error()))
+		}
+		unfinishByt, err := json.Marshal(repliteController.taskSignalMap)
+		if err != nil {
+			panic(fmt.Sprintf("序列化taskSingalMap(%v)出错:%s", repliteController.taskSignalMap, err.Error()))
+		}
+		io.Copy(file, bytes.NewBuffer(unfinishByt))
 	}
 }
 
@@ -830,6 +901,7 @@ func newController(cmd *CmdParams) *controller {
 	controller.taskSignalMap = make(map[string]*VariableParams)
 	controller.params = cmd
 	controller.stdMutex = &sync.RWMutex{}
+	controller.failedChan = &sync.RWMutex{}
 	// controller.once = &sync.Once{}
 	// analy the package
 	fileStr := cmd.FileStr
@@ -961,11 +1033,11 @@ func (fixup *fixupChain) handle(repliteController *controller) {
 				if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
 					repliteController.finalizeSignal <- fmt.Errorf("生成request失败:%s,已经恢复socks连接%d次", err.Error(), repliteController.opTolerance)
 				} else {
-					if atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
-						// repliteController.retryConn()
-						time.Sleep(defaultSocksRecoverTime)
-						atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
-					}
+					// if atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
+					// repliteController.retryConn()
+					// 	time.Sleep(defaultSocksRecoverTime)
+					// 	atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
+					// }
 					goto recoverRequest
 				}
 			}
@@ -979,8 +1051,8 @@ func (fixup *fixupChain) handle(repliteController *controller) {
 					begin <- struct{}{}
 				})
 			}
-			if _, ok := ignoreErrorMap[err]; err != nil && !ok {
-				repliteController.finalizeSignal <- fmt.Errorf("request %v error failed: %s", request, err.Error())
+			if _, ok := ignoreErrorMap[err]; err != nil && ok {
+				repliteController.finalizeSignal <- fmt.Errorf("发送请求异常(%v) : %s", request, err.Error())
 			}
 		}(value)
 		time.Sleep(smoothRequest)
@@ -1035,11 +1107,11 @@ func (page *pageChain) handle(repliteController *controller) {
 				if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
 					repliteController.finalizeSignal <- fmt.Errorf("生成request失败:%s,已经恢复socks连接%d次", err.Error(), repliteController.opTolerance)
 				} else {
-					if atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
-						// repliteController.retryConn()
-						time.Sleep(defaultSocksRecoverTime)
-						atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
-					}
+					// if atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
+					// repliteController.retryConn()
+					// 	time.Sleep(defaultSocksRecoverTime)
+					// 	atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
+					// }
 					goto recoverRequest
 				}
 			}
@@ -1055,7 +1127,10 @@ func (page *pageChain) handle(repliteController *controller) {
 				})
 			}
 			if _, ok := ignoreErrorMap[err]; err != nil && !ok {
-				repliteController.finalizeSignal <- fmt.Errorf("request %v error failed: %s", request, err.Error())
+				if strings.Contains(err.Error(), "the connected party did not properly respond after a period of time") || strings.Contains(err.Error(), " connected host has failed to respond") {
+					return
+				}
+				repliteController.finalizeSignal <- fmt.Errorf("发送请求异常(%v) : %s", request, err.Error())
 			}
 		}(curForm)
 		time.Sleep(smoothRequest)
@@ -1121,11 +1196,11 @@ func (list *listChain) handle(repliteController *controller) {
 				if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
 					repliteController.finalizeSignal <- fmt.Errorf("生成request失败:%s,已经恢复socks连接%d次", err.Error(), repliteController.opTolerance)
 				} else {
-					if atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
-						// repliteController.retryConn()
-						time.Sleep(defaultSocksRecoverTime)
-						atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
-					}
+					// if atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
+					// repliteController.retryConn()
+					// time.Sleep(defaultSocksRecoverTime)
+					// 	atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
+					// }
 					goto recoverRequest
 				}
 			}
@@ -1140,7 +1215,7 @@ func (list *listChain) handle(repliteController *controller) {
 				})
 			}
 			if _, ok := ignoreErrorMap[err]; err != nil && !ok {
-				repliteController.finalizeSignal <- fmt.Errorf("request %v error failed: %s", request, err.Error())
+				repliteController.finalizeSignal <- fmt.Errorf("发送请求异常(%v) : %s", request, err.Error())
 			}
 		}(i)
 		time.Sleep(smoothRequest)
