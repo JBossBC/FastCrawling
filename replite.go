@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -511,18 +512,18 @@ func main() {
 	// })
 	// }()
 
-	// //TODO start performance reporter
-	// func() {
-	// 	file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
-	// 	if err != nil {
-	// 		panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
-	// 	}
-	// 	err = trace.Start(file)
-	// 	if err != nil {
-	// 		panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
-	// 	}
-	// }()
-	// defer trace.Stop()
+	//TODO start performance reporter
+	func() {
+		file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
+		}
+		err = trace.Start(file)
+		if err != nil {
+			panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
+		}
+	}()
+	defer trace.Stop()
 	controller.requestProbe()
 	// create the request and  send to colly.collector to execute
 	controller.executeRepliteChain()
@@ -531,6 +532,7 @@ func main() {
 	controller.finish = true
 	controller.finalizer()
 	controller.releaseUnless()
+	fmt.Println("\n-----------------本次任务执行完毕--------------")
 	// c.Async = true
 }
 
@@ -583,7 +585,7 @@ func (repliteController *controller) finalizer() {
 	fmt.Println("是否要进行错误文件扫描:(true or false)")
 	fmt.Scanln(&isRecover)
 	if strings.ToLower(isRecover) != "false" {
-		var errorOffset = int(float64((fileHeap[0].priority + fileHeap[len(fileHeap)-1].priority)) / trembleOffsetTime)
+		var errorOffset = int(float64((fileHeap[0].priority + fileHeap[len(fileHeap)-1].priority)) / 2)
 		fmt.Printf("继续判断错误的文件大小在%d以内,是否需要更改:(true or false)\n", errorOffset)
 		var operate string
 		fmt.Scanln(&operate)
@@ -623,7 +625,9 @@ func (repliteController *controller) finalizer() {
 	fmt.Println("总共需要修复的文件数量:", len(renewParams))
 	repliteController.taskSignalMap = renewParams
 	fmt.Println("----------正在恢复错误的文件-----------")
-	repliteController.handleChain.handle(repliteController)
+	if len(repliteController.taskSignalMap) > 0 {
+		repliteController.handleChain.handle(repliteController)
+	}
 }
 
 func printRenewFiles(params *map[string]*VariableParams) {
