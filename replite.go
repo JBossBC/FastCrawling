@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"container/heap"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -19,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -193,6 +193,9 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 		options[i](repliteController)
 	}
 	repliteController.c.OnError(func(r *colly.Response, err error) {
+		if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
+			repliteController.finalizeSignal <- fmt.Errorf("因网络原因导致重新建立连接多次,建议检查后台是否在线和所设线程的数量,防止被后台检测到和网络拥塞造成代理服务器崩溃:%s", err.Error())
+		}
 		if errors.Is(err, context.DeadlineExceeded) {
 			r.Request.Retry()
 			return
@@ -206,9 +209,6 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 			repliteController.retryConn()
 			r.Request.Retry()
 			return
-		}
-		if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
-			repliteController.finalizeSignal <- fmt.Errorf("因网络原因导致重新建立连接多次,建议检查后台是否在线和所设线程的数量,防止被后台检测到和网络拥塞造成代理服务器崩溃:%s", err.Error())
 		}
 	})
 	repliteController.c.OnRequest(func(r *colly.Request) {
@@ -336,6 +336,7 @@ func (repliteController *controller) cookieRecover(r *colly.Response) {
 	for atomic.CompareAndSwapInt32(&repliteController.requestMutex, 0, 1) {
 		break
 	}
+	defer atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
 	repliteController.stdMutex.Lock()
 	defer repliteController.stdMutex.Unlock()
 	id := r.Request.Ctx.Get("id")
@@ -344,15 +345,20 @@ func (repliteController *controller) cookieRecover(r *colly.Response) {
 	go func(nextChan chan any) {
 		once := sync.Once{}
 		timer := time.NewTimer(1 * time.Minute)
+		var hasInput bool
 		for {
 			select {
 			case <-timer.C:
-				repliteController.finalizeSignal <- errors.New("自愿退出程序")
+				if !hasInput {
+					repliteController.finalizeSignal <- errors.New("自愿退出程序")
+					return
+				}
 			default:
 				once.Do(func() {
 					fmt.Println("是否要退出程序:(true or false)")
 					var exitFlag string = "true"
 					fmt.Scanln(&exitFlag)
+					hasInput = true
 					if strings.ToLower(exitFlag) == "true" {
 						repliteController.finalizeSignal <- errors.New("自愿退出程序")
 					} else {
@@ -402,7 +408,6 @@ func (repliteController *controller) cookieRecover(r *colly.Response) {
 	repliteController.cookiesChange = true
 	repliteController.cookies = cookiesToString(newCookies)
 	// repliteController.proxyStatus = false
-	atomic.CompareAndSwapInt32(&repliteController.requestMutex, 1, 0)
 }
 func cookiesToString(cookies []*http.Cookie) string {
 	cookieStrs := make([]string, len(cookies))
@@ -421,8 +426,8 @@ func (repliteController *controller) recoverPersistence() {
 			// os.RemoveAll(targetDict)
 		}
 	}()
-	var pathError *os.PathError
-	if _, err := os.Open(targetDict); errors.As(err, &pathError) {
+	// var pathError *os.PathError
+	if _, err := os.Open(targetDict); os.IsNotExist(err) {
 		os.Mkdir(targetDict, 0644)
 	}
 	// keep the origin package to next user
@@ -475,8 +480,8 @@ func main() {
 	// before execute the chain link ,start the monitor
 	// create .replite hidden dict
 	dict := fmt.Sprintf("%s%c%s", controller.params.TargetDictLoc, os.PathSeparator, ".replite")
-	var pathError *os.PathError
-	if _, err := os.Open(dict); errors.As(err, &pathError) {
+	// var pathError *os.PathError
+	if _, err := os.Open(dict); os.IsNotExist(err) {
 		os.Mkdir(dict, 0644)
 	}
 	// start metrics
@@ -573,52 +578,46 @@ func (repliteController *controller) finalizer() {
 	}
 	fmt.Println("检测到未爬取的文件有:")
 	printRenewFiles(&renewParams)
-	heap.Init(&fileHeap)
-	// minFileSize, err := strconv.ParseInt(fileHeap[0].priority, 10, 64)
-	// if err != nil {
-	// 	panic(fmt.Sprintf("错误的文件名%s:%s", fileHeap[0].value, err.Error()))
-	// }
-	// maxFileSize, err := strconv.ParseInt(fileHeap[len(fileHeap)-1].value, 10, 64)
-	// if err != nil {
-	// 	panic(fmt.Sprintf("错误的文件名%s:%s", fileHeap[len(fileHeap)-1].value, err.Error()))
-	// }
+	sort.Sort(fileHeap)
 	var isRecover string = "false"
 	fmt.Println("是否要进行错误文件扫描:(true or false)")
 	fmt.Scanln(&isRecover)
-	if strings.ToLower(isRecover) == "false" {
-		return
-	}
-	var errorOffset = int(float64((fileHeap[0].priority + fileHeap[len(fileHeap)-1].priority)) / trembleOffsetTime)
-	fmt.Printf("继续判断错误的文件大小在%d以内,是否需要更改:(true or false)\n", errorOffset)
-	var operate string
-	fmt.Scanln(&operate)
-	if strings.ToLower(operate) == "true" {
-		fmt.Print("请输入实际错误文件的大小为0-")
-		_, err = fmt.Scanln(&errorOffset)
-		if err != nil {
-			panic("请输入数字")
+	if strings.ToLower(isRecover) != "false" {
+		var errorOffset = int(float64((fileHeap[0].priority + fileHeap[len(fileHeap)-1].priority)) / trembleOffsetTime)
+		fmt.Printf("继续判断错误的文件大小在%d以内,是否需要更改:(true or false)\n", errorOffset)
+		var operate string
+		fmt.Scanln(&operate)
+		if strings.ToLower(operate) == "true" {
+			fmt.Print("请输入实际错误文件的大小为0-")
+			_, err = fmt.Scanln(&errorOffset)
+			if err != nil {
+				panic("请输入数字")
+			}
+		}
+		var flag bool = true
+		var cur = len(fileHeap) - 1
+		for flag {
+			if cur < 0 {
+				break
+			}
+			fInfo := fileHeap[cur]
+			if fInfo == nil {
+				break
+			}
+			// itemStr := fInfo.value
+			// item, err := strconv.ParseInt(itemStr, 10, 64)
+			if err != nil {
+				panic(err.Error())
+			}
+			if fInfo.priority <= errorOffset {
+				renewParams[fInfo.value] = allMap[fInfo.value]
+			} else {
+				flag = false
+			}
+			cur--
 		}
 	}
-	var flag bool = true
-	for flag {
-		if len(fileHeap) <= 0 {
-			break
-		}
-		fInfo := heap.Pop(&fileHeap).(*FItem)
-		if fInfo == nil {
-			break
-		}
-		// itemStr := fInfo.value
-		// item, err := strconv.ParseInt(itemStr, 10, 64)
-		if err != nil {
-			panic(err.Error())
-		}
-		if fInfo.priority <= errorOffset {
-			renewParams[fInfo.value] = allMap[fInfo.value]
-		} else {
-			flag = false
-		}
-	}
+
 	fmt.Println("检测到需要恢复的全部文件:")
 	printRenewFiles(&renewParams)
 	fmt.Println("总共需要修复的文件数量:", len(renewParams))
@@ -873,8 +872,8 @@ func handleParams() (cmd *CmdParams) {
 		return
 	}
 	// create the dict
-	var pathError *os.PathError
-	if _, err := os.Open(dictData); errors.As(err, &pathError) {
+	// var pathError *os.PathError
+	if _, err := os.Open(dictData); os.IsNotExist(err) {
 		os.Mkdir(dictData, 0644)
 	}
 	cmd.Username = username
@@ -889,6 +888,22 @@ func handleParams() (cmd *CmdParams) {
 	cmd.ConcurrentNumber = concurrentNumber
 	cmd.IntervalTime = intervalTime
 	cmd.List = list
+	var targetDict = fmt.Sprintf("%s%c%s", cmd.TargetDictLoc, os.PathSeparator, ".replite")
+	paramsJSON := fmt.Sprintf("%s%c%s", targetDict, os.PathSeparator, "params.json")
+	if _, err := os.Open(paramsJSON); os.IsNotExist(err) {
+		if _, err := os.Open(targetDict); os.IsNotExist(err) {
+			os.Mkdir(targetDict, 0644)
+		}
+		paramsInfoBys, err := json.Marshal(cmd)
+		if err != nil {
+			panic(fmt.Sprintf("持久化用户参数信息时发生未知错误:%s", err.Error()))
+		}
+		paramsFile, err := os.OpenFile(paramsJSON, os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("持久化未爬取的数据时发生未知错误:%s", err.Error()))
+		}
+		io.Copy(paramsFile, bytes.NewBuffer(paramsInfoBys))
+	}
 	return cmd
 }
 
@@ -1293,5 +1308,17 @@ find:
 	if !reasonable {
 		panic("数据包txt文件未标注可变参数,请用$$标注可变参数")
 	}
-
+	// keep the origin package to next user
+	var targetDict = fmt.Sprintf("%s%c%s", repliteController.params.TargetDictLoc, os.PathSeparator, ".replite")
+	var targetFile = fmt.Sprintf("%s%c%s", targetDict, os.PathSeparator, "originPackage.txt")
+	if _, err := os.Open(targetFile); os.IsNotExist(err) {
+		if _, err := os.Open(targetDict); os.IsNotExist(err) {
+			os.Mkdir(targetDict, 0644)
+		}
+		file, err := os.OpenFile(targetFile, os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("持久化未爬取的数据时发生未知错误:%s", err.Error()))
+		}
+		io.Copy(file, bytes.NewBuffer(repliteController.originPackage))
+	}
 }
