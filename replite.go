@@ -18,7 +18,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -512,18 +511,18 @@ func main() {
 	// })
 	// }()
 
-	//TODO start performance reporter
-	func() {
-		file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
-		}
-		err = trace.Start(file)
-		if err != nil {
-			panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
-		}
-	}()
-	defer trace.Stop()
+	// //TODO start performance reporter
+	// func() {
+	// 	file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
+	// 	if err != nil {
+	// 		panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
+	// 	}
+	// 	err = trace.Start(file)
+	// 	if err != nil {
+	// 		panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
+	// 	}
+	// }()
+	// defer trace.Stop()
 	controller.requestProbe()
 	// create the request and  send to colly.collector to execute
 	controller.executeRepliteChain()
@@ -597,9 +596,9 @@ func (repliteController *controller) finalizer() {
 			}
 		}
 		var flag bool = true
-		var cur = len(fileHeap) - 1
+		var cur = 0
 		for flag {
-			if cur < 0 {
+			if cur >= len(fileHeap) {
 				break
 			}
 			fInfo := fileHeap[cur]
@@ -608,15 +607,15 @@ func (repliteController *controller) finalizer() {
 			}
 			// itemStr := fInfo.value
 			// item, err := strconv.ParseInt(itemStr, 10, 64)
-			if err != nil {
-				panic(err.Error())
-			}
+			// if err != nil {
+			// 	panic(err.Error())
+			// }
 			if fInfo.priority <= errorOffset {
 				renewParams[fInfo.value] = allMap[fInfo.value]
 			} else {
 				flag = false
 			}
-			cur--
+			cur++
 		}
 	}
 
