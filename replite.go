@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -306,6 +307,7 @@ func (repliteController *controller) retryConn() {
 		return
 	}
 	fmt.Println("正在重连代理服务器")
+	// wait the async task maybe pass CAS is false to exit the retryConn
 	time.Sleep(defaultSocksRecoverTime)
 	if repliteController.params.HasProxy {
 		renewSocks5, err := proxy.SOCKS5("tcp", fmt.Sprintf("%s:%d", repliteController.params.Ip, repliteController.params.Port), &proxy.Auth{User: repliteController.params.Username, Password: repliteController.params.Password}, proxy.Direct)
@@ -344,7 +346,7 @@ func (repliteController *controller) cookieRecover(r *colly.Response) {
 	nextSingal := make(chan any, 0)
 	go func(nextChan chan any) {
 		once := sync.Once{}
-		timer := time.NewTimer(1 * time.Minute)
+		timer := time.NewTimer(5 * time.Minute)
 		var hasInput bool
 		for {
 			select {
@@ -511,18 +513,18 @@ func main() {
 	// })
 	// }()
 
-	// //TODO start performance reporter
-	// func() {
-	// 	file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
-	// 	if err != nil {
-	// 		panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
-	// 	}
-	// 	err = trace.Start(file)
-	// 	if err != nil {
-	// 		panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
-	// 	}
-	// }()
-	// defer trace.Stop()
+	//TODO start performance reporter
+	func() {
+		file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
+		}
+		err = trace.Start(file)
+		if err != nil {
+			panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
+		}
+	}()
+	defer trace.Stop()
 	controller.requestProbe()
 	// create the request and  send to colly.collector to execute
 	controller.executeRepliteChain()
@@ -566,13 +568,17 @@ func (repliteController *controller) finalizer() {
 	})
 	//TODO struct add the field to ignore this circul
 	var begin int64 = math.MaxInt64
+	var end int64 = math.MinInt64
 	for key, _ := range allMap {
 		keyInt, _ := strconv.ParseInt(key, 10, 64)
 		if keyInt < begin {
 			begin = keyInt
 		}
+		if keyInt > end {
+			end = keyInt
+		}
 	}
-	for i := int(begin); i < len(allMap); i++ {
+	for i := int(begin); i <= int(end); i++ {
 		if _, ok := ExistsInt[int64(i)]; !ok {
 			renewParams[strconv.FormatInt(int64(i), 10)] = allMap[strconv.FormatInt(int64(i), 10)]
 		}
@@ -750,10 +756,12 @@ func (repliteController *controller) requestProbe() {
 func (repliteController *controller) startingMetrics() {
 	repliteController.metrics = new(Metrics)
 	repliteController.metrics.NowStartTime = time.Now()
+	// metrics file isn't necessary
 	if repliteController.params.Fixup != "" {
 		file, err := os.Open(fmt.Sprintf("%s%c%s%c%s", repliteController.params.TargetDictLoc, os.PathSeparator, ".replite", os.PathSeparator, "metrics.json"))
 		if err != nil {
-			panic(fmt.Sprintf("metrics starting failed:%s", err.Error()))
+			fmt.Printf("ERROR:metrics starting failed:%s\n", err.Error())
+			return
 		}
 		err = json.NewDecoder(bufio.NewReader(file)).Decode(repliteController.metrics)
 		if err != nil {
@@ -1069,7 +1077,13 @@ func (fixup *fixupChain) handle(repliteController *controller) {
 					begin <- struct{}{}
 				})
 			}
-			if _, ok := ignoreErrorMap[err]; err != nil && ok {
+			if err == nil {
+				return
+			}
+			if _, ok := ignoreErrorMap[err]; err != nil && !ok {
+				if strings.Contains(err.Error(), "the connected party did not properly respond after a period of time") || strings.Contains(err.Error(), " connected host has failed to respond") {
+					return
+				}
 				repliteController.finalizeSignal <- fmt.Errorf("发送请求异常(%v) : %s", request, err.Error())
 			}
 		}(value)
@@ -1143,6 +1157,9 @@ func (page *pageChain) handle(repliteController *controller) {
 					begin <- struct{}{}
 					begin <- struct{}{}
 				})
+			}
+			if err == nil {
+				return
 			}
 			if _, ok := ignoreErrorMap[err]; err != nil && !ok {
 				if strings.Contains(err.Error(), "the connected party did not properly respond after a period of time") || strings.Contains(err.Error(), " connected host has failed to respond") {
@@ -1232,7 +1249,13 @@ func (list *listChain) handle(repliteController *controller) {
 					begin <- struct{}{}
 				})
 			}
+			if err == nil {
+				return
+			}
 			if _, ok := ignoreErrorMap[err]; err != nil && !ok {
+				if strings.Contains(err.Error(), "the connected party did not properly respond after a period of time") || strings.Contains(err.Error(), " connected host has failed to respond") {
+					return
+				}
 				repliteController.finalizeSignal <- fmt.Errorf("发送请求异常(%v) : %s", request, err.Error())
 			}
 		}(i)
