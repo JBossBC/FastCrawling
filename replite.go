@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -17,7 +19,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -177,7 +178,7 @@ func withRequestTimeout(time time.Duration) adapterOptions {
 }
 
 func (repliteController *controller) buildCollector(proxyServer *ProxyServer, options ...adapterOptions) {
-	repliteController.c = colly.NewCollector()
+	repliteController.c = colly.NewCollector(colly.AllowURLRevisit())
 	repliteController.c.SetRequestTimeout(defaultRequestTimeout)
 	// c.Async = true
 	if repliteController.params.HasProxy {
@@ -187,7 +188,8 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 		}
 		// transports := http.DefaultTransport
 
-		transport := http.Transport{Dial: socks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false}
+		transport := http.Transport{Dial: socks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false,
+			TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper)}
 		repliteController.c.WithTransport(&transport)
 	}
 	for i := 0; i < len(options); i++ {
@@ -314,7 +316,7 @@ func (repliteController *controller) retryConn() {
 		if err != nil {
 			repliteController.finalizeSignal <- fmt.Errorf("socks5代理服务器连接错误:%s", err.Error())
 		}
-		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false}
+		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false, TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper)}
 		repliteController.c.WithTransport(&transport)
 	}
 	//TODO if hasnt the proxy,how to repair this question
@@ -524,18 +526,18 @@ func main() {
 	// })
 	// }()
 
-	//TODO start performance reporter
-	func() {
-		file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
-		}
-		err = trace.Start(file)
-		if err != nil {
-			panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
-		}
-	}()
-	defer trace.Stop()
+	// //TODO start performance reporter
+	// func() {
+	// 	file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
+	// 	if err != nil {
+	// 		panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
+	// 	}
+	// 	err = trace.Start(file)
+	// 	if err != nil {
+	// 		panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
+	// 	}
+	// }()
+	// defer trace.Stop()
 	controller.requestProbe()
 	// create the request and  send to colly.collector to execute
 	controller.executeRepliteChain()
@@ -696,7 +698,7 @@ func (repliteController *controller) requestProbe() {
 			if err != nil {
 				panic(fmt.Errorf("socks5代理服务器连接错误:%s", err.Error()))
 			}
-			client.Transport = &http.Transport{Dial: forerunner.Dial}
+			client.Transport = &http.Transport{Dial: forerunner.Dial, TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper)}
 		}
 		defer client.CloseIdleConnections()
 		response, err := client.Do(req)
