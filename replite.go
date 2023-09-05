@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"runtime/trace"
@@ -24,6 +25,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/gocolly/colly"
@@ -491,13 +493,17 @@ func main() {
 	// defer func() {
 	// 	controller.once.Do(func() {
 	defer controller.saveMetrics()
+	//operate signal
+	exitChan := make(chan os.Signal, 0)
+	// system is forced exit
+	signal.Notify(exitChan, syscall.SIGINT, syscall.SIGHUP)
 	go func() {
 		for {
 			select {
 			case err := <-controller.finalizeSignal:
 				// change the flag to stop all request
 				atomic.StoreInt32(&controller.requestMutex, 2)
-				fmt.Println("发生不可逆错误,正在退出", err)
+				fmt.Println("正在退出", err)
 				//save metrics when final error occur
 				// controller.once.Do(func() {
 				controller.saveMetrics()
@@ -505,6 +511,13 @@ func main() {
 				controller.recoverPersistence()
 				// })
 				os.Exit(1)
+				// receive the operation system signal to finalizer
+			case <-exitChan:
+				atomic.StoreInt32(&controller.requestMutex, 2)
+				controller.saveMetrics()
+				// 保存未能爬取的数据集合
+				controller.recoverPersistence()
+				os.Exit(0)
 			}
 		}
 	}()
@@ -537,6 +550,13 @@ func main() {
 	// c.Async = true
 }
 
+/*
+*
+
+	analysis the error file and missing file, and retry get it
+
+*
+*/
 func (repliteController *controller) finalizer() {
 	fmt.Println("---------正在扫描全部response是否符合预期------")
 	fileHeap := make(PriorityQueue, 0)
@@ -566,7 +586,7 @@ func (repliteController *controller) finalizer() {
 		fileHeap = append(fileHeap, cur)
 		return nil
 	})
-	//TODO struct add the field to ignore this circul
+	//TODO struct add the field to ignore this circle
 	var begin int64 = math.MaxInt64
 	var end int64 = math.MinInt64
 	for key, _ := range allMap {
