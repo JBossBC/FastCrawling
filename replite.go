@@ -4,8 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
-	"context"
-	_ "embed"
 	"encoding/json"
 	"errors"
 	"flag"
