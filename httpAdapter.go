@@ -5,9 +5,6 @@
 // 	"io"
 // 	"net/http"
 // 	"strings"
-
-// 	"golang.org/x/net/http2"
-// 	"golang.org/x/net/http2/hpack"
 // )
 
 // type httpAdapter interface {
@@ -29,7 +26,4 @@
 // }
 
 // func readRequest(b *bufio.Reader) (req *http.Request, err error) {
-// 	http2Reader := http2.NewReader(reader, new(hpack.Decoder))
-// 	return http.ReadRequest(http2Reader)
-
 // }

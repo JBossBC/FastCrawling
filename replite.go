@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -19,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,6 +30,8 @@ import (
 	"github.com/gocolly/colly"
 	"golang.org/x/net/proxy"
 )
+
+//TODO allow the http2.0 connection
 
 // //go:embed resource.res
 // var resourceData string
@@ -189,7 +191,7 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 		// transports := http.DefaultTransport
 
 		transport := http.Transport{Dial: socks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false,
-			TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper)}
+			ForceAttemptHTTP2: true}
 		repliteController.c.WithTransport(&transport)
 	}
 	for i := 0; i < len(options); i++ {
@@ -249,8 +251,6 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 		// 	parseRequest.Wait()
 		// }
 		id := r.Request.Ctx.Get("id")
-
-		//TODO tremable inspect
 		//TODO if the cookie be recoverd need to execute ,but the proxy conn acquire the mutex  cause the cookieRecover cant execute
 		if repliteController.checkTremble(len(r.Body)) {
 			//release the CAS requestMutex  pressure,and upgrade the mutex granularity
@@ -316,7 +316,7 @@ func (repliteController *controller) retryConn() {
 		if err != nil {
 			repliteController.finalizeSignal <- fmt.Errorf("socks5代理服务器连接错误:%s", err.Error())
 		}
-		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false, TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper)}
+		transport := http.Transport{Dial: renewSocks5.Dial, MaxIdleConns: repliteController.params.ConcurrentNumber * defaultConnTimesForConcurrent, IdleConnTimeout: 90 * time.Second, DisableKeepAlives: false, ForceAttemptHTTP2: true}
 		repliteController.c.WithTransport(&transport)
 	}
 	//TODO if hasnt the proxy,how to repair this question
@@ -526,18 +526,17 @@ func main() {
 	// })
 	// }()
 
-	// //TODO start performance reporter
-	// func() {
-	// 	file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
-	// 	if err != nil {
-	// 		panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
-	// 	}
-	// 	err = trace.Start(file)
-	// 	if err != nil {
-	// 		panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
-	// 	}
-	// }()
-	// defer trace.Stop()
+	func() {
+		file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
+		}
+		err = trace.Start(file)
+		if err != nil {
+			panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
+		}
+	}()
+	defer trace.Stop()
 	controller.requestProbe()
 	// create the request and  send to colly.collector to execute
 	controller.executeRepliteChain()
@@ -586,7 +585,6 @@ func (repliteController *controller) finalizer() {
 		fileHeap = append(fileHeap, cur)
 		return nil
 	})
-	//TODO struct add the field to ignore this circle
 	var begin int64 = math.MaxInt64
 	var end int64 = math.MinInt64
 	for key, _ := range allMap {
@@ -698,7 +696,7 @@ func (repliteController *controller) requestProbe() {
 			if err != nil {
 				panic(fmt.Errorf("socks5代理服务器连接错误:%s", err.Error()))
 			}
-			client.Transport = &http.Transport{Dial: forerunner.Dial, TLSNextProto: make(map[string]func(string, *tls.Conn) http.RoundTripper)}
+			client.Transport = &http.Transport{Dial: forerunner.Dial, ForceAttemptHTTP2: true}
 		}
 		defer client.CloseIdleConnections()
 		response, err := client.Do(req)
@@ -829,7 +827,7 @@ func (repliteController *controller) releaseUnless() {
 
 // create replitechain and execute
 func (repliteController *controller) executeRepliteChain() {
-	if repliteController.params.From != 0 && repliteController.params.To != 0 {
+	if repliteController.params.From >= 0 && repliteController.params.To >= 0 {
 		repliteController.params.IsPage = true
 	} else if repliteController.params.List != "" {
 		repliteController.params.IsList = true
@@ -875,7 +873,7 @@ func handleParams() (cmd *CmdParams) {
 	flag.Parse()
 	var preParamsInspect = "请检查你的输入参数,如果不是选择[--fixup],[--target],[--package]是必须指定的参数,执行一次爬虫的时候，可变参数只能是[--from], [--to] 或者 [--list] 其中一个"
 	if fixup == "" {
-		if fileStr == "" || (((from == 0 && to == 0) || (list == "")) && ((from == 0 && to == 0) && (list == ""))) {
+		if fileStr == "" || ((to == 0 || (list == "")) && (to == 0 && (list == ""))) {
 			panic(preParamsInspect)
 		}
 		if port != -1 {
@@ -1224,7 +1222,6 @@ func (list *listChain) handle(repliteController *controller) {
 	var i = 0
 	once := sync.Once{}
 	begin := make(chan struct{}, 1)
-	// todo presistent the data for  request panic
 	for i := 0; i < len(lines); i++ {
 		repliteController.taskSignalMap[strconv.Itoa(i)] = &VariableParams{
 			Id:    int32(i),
