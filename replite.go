@@ -18,7 +18,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
-	"runtime/trace"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,7 +26,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gocolly/colly"
+	"github.com/gocolly/colly/v2"
 	"golang.org/x/net/proxy"
 )
 
@@ -39,7 +38,7 @@ import (
 
 const maxToleranceTimesForNetwork = 30
 
-const defualtRequestTimeout = 10 * time.Hour
+const defaultRequestTimeout = 10 * time.Hour
 
 const defaultSocksRecoverTime = 5 * time.Second
 
@@ -51,7 +50,7 @@ var trembleOffsetTime = 1.3
 const defaultConnTimesForConcurrent = 5
 
 // request timeout for global
-const defaultRequestTimeout = 2 * time.Minute
+const defaultTimeoutForPerRequest = 2 * time.Minute
 
 // ignore error ,which be resolved by
 
@@ -526,17 +525,17 @@ func main() {
 	// })
 	// }()
 
-	func() {
-		file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
-		}
-		err = trace.Start(file)
-		if err != nil {
-			panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
-		}
-	}()
-	defer trace.Stop()
+	// func() {
+	// 	file, err := os.OpenFile(fmt.Sprintf("%s%c%s", dict, os.PathSeparator, "trace.out"), os.O_CREATE|os.O_TRUNC, 0644)
+	// 	if err != nil {
+	// 		panic(fmt.Sprintf("生成检测报告文件失败:%s", err.Error()))
+	// 	}
+	// 	err = trace.Start(file)
+	// 	if err != nil {
+	// 		panic(fmt.Sprintf("开启检测检测失败:%s", err.Error()))
+	// 	}
+	// }()
+	// defer trace.Stop()
 	controller.requestProbe()
 	// create the request and  send to colly.collector to execute
 	controller.executeRepliteChain()
@@ -596,7 +595,13 @@ func (repliteController *controller) finalizer() {
 			end = keyInt
 		}
 	}
-	for i := int(begin); i <= int(end); i++ {
+	var tmpStep = 1
+	// make sure the controller is loaded before executing this step
+	// this process make sure the sector is true when params step greater than one  in the page handle
+	if repliteController.params.Step > 1 {
+		tmpStep = repliteController.params.Step
+	}
+	for i := int(begin); i <= int(end); i += tmpStep {
 		if _, ok := ExistsInt[int64(i)]; !ok {
 			renewParams[strconv.FormatInt(int64(i), 10)] = allMap[strconv.FormatInt(int64(i), 10)]
 		}
@@ -680,7 +685,8 @@ func (repliteController *controller) requestProbe() {
 			panic(fmt.Sprintf("反序列化文件%s出错:%s", fileStr, err.Error()))
 		}
 	} else {
-		req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), string(repliteController.singleTemplate.originContent), string(repliteController.singleTemplate.suffix)))))
+		req, err := repliteController.ReadRequest(string(repliteController.singleTemplate.originContent))
+		// req, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), string(repliteController.singleTemplate.originContent), string(repliteController.singleTemplate.suffix)))))
 		if err != nil {
 			panic(fmt.Sprintf("预生成request出错:%s", err.Error()))
 		}
@@ -827,7 +833,7 @@ func (repliteController *controller) releaseUnless() {
 
 // create replitechain and execute
 func (repliteController *controller) executeRepliteChain() {
-	if repliteController.params.From >= 0 && repliteController.params.To >= 0 {
+	if repliteController.params.From >= 0 && repliteController.params.To > 0 {
 		repliteController.params.IsPage = true
 	} else if repliteController.params.List != "" {
 		repliteController.params.IsList = true
@@ -970,7 +976,7 @@ func newController(cmd *CmdParams) *controller {
 		Port:     cmd.Port,
 		Username: cmd.Username,
 		Password: cmd.Password,
-	}, withLimitRule(&colly.LimitRule{DomainGlob: controller.unlessRequest.Host, Delay: cmd.IntervalTime, Parallelism: cmd.ConcurrentNumber}), withRequestTimeout(defualtRequestTimeout))
+	}, withLimitRule(&colly.LimitRule{DomainGlob: controller.unlessRequest.Host, Delay: cmd.IntervalTime, Parallelism: cmd.ConcurrentNumber}), withRequestTimeout(defaultTimeoutForPerRequest))
 	return controller
 }
 
@@ -1069,7 +1075,8 @@ func (fixup *fixupChain) handle(repliteController *controller) {
 	for _, value := range repliteController.taskSignalMap {
 		go func(value *VariableParams) {
 		recoverRequest:
-			request, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), value.Value, string(repliteController.singleTemplate.suffix)))))
+			request, err := repliteController.ReadRequest(value.Value)
+			// request, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), value.Value, string(repliteController.singleTemplate.suffix)))))
 			if err != nil {
 				if errors.Is(err, &net.OpError{}) {
 					atomic.AddInt32(&repliteController.opTolerance, 1)
@@ -1117,6 +1124,7 @@ type pageChain struct {
 	baseRepliteChain
 }
 
+// TODO if the step cant be one, the create file is error
 func (page *pageChain) handle(repliteController *controller) {
 	if !repliteController.params.IsPage {
 		page.next.handle(repliteController)
@@ -1144,12 +1152,14 @@ func (page *pageChain) handle(repliteController *controller) {
 	if curForm <= repliteController.params.To {
 		needRun = true
 	}
+	fmt.Printf("需要执行的任务总数:%d\n", repliteController.params.To-curForm+1)
 	for curForm <= repliteController.params.To {
 		go func(from int) {
 			fromVar := strconv.FormatInt(int64(from), 10)
 			// fmt.Println(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), fromVar, string(repliteController.singleTemplate.suffix)))
 		recoverRequest:
-			request, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), fromVar, string(repliteController.singleTemplate.suffix)))))
+			request, err := repliteController.ReadRequest(fromVar)
+			// request, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), fromVar, string(repliteController.singleTemplate.suffix)))))
 			if err != nil {
 				if errors.Is(err, &net.OpError{}) {
 					atomic.AddInt32(&repliteController.opTolerance, 1)
@@ -1236,11 +1246,13 @@ func (list *listChain) handle(repliteController *controller) {
 	if i < len(lines) {
 		needRun = true
 	}
+	fmt.Printf("需要执行的任务总数:%d\n", len(repliteController.taskSignalMap))
 	for i < len(lines) {
 		// time.Sleep(time.Millisecond)
 		go func(i int) {
 		recoverRequest:
-			request, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), lines[i], string(repliteController.singleTemplate.suffix)))))
+			request, err := repliteController.ReadRequest(lines[i])
+			// request, err := http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), lines[i], string(repliteController.singleTemplate.suffix)))))
 			if err != nil {
 				if errors.Is(err, &net.OpError{}) {
 					atomic.AddInt32(&repliteController.opTolerance, 1)
@@ -1296,6 +1308,14 @@ type requestTemplate struct {
 	suffix        []byte
 	originContent []byte
 	// noCopy uintptr
+	isBody bool
+	body   *bodySequence
+}
+
+type bodySequence struct {
+	bodyPrefix       []byte
+	bodySufix        []byte
+	bodyCommonLength int
 }
 
 // this page defend the concurrent operate to repliteController.taskSignalMap
@@ -1329,18 +1349,30 @@ func (repliteController *controller) requestTemplateHandle() {
 	var reasonable = false
 	// var i int = 0
 	repliteController.singleTemplate = new(requestTemplate)
+	repliteController.singleTemplate.body = new(bodySequence)
+	//make sure that whether the variable params are in the body
+	slice := bytes.SplitN(repliteController.originPackage, []byte("\r\n\r\n"), 2)
+	bodySep := len(slice[0])
 	for i := 0; i < len(repliteController.originPackage); i++ {
 		if repliteController.originPackage[i] == 36 {
+			if i > bodySep {
+				repliteController.singleTemplate.isBody = true
+			}
 			repliteController.singleTemplate.prefix = make([]byte, i)
+			repliteController.singleTemplate.body.bodyPrefix = make([]byte, i-bodySep-4)
 			copy(repliteController.singleTemplate.prefix, repliteController.originPackage[:i])
+			copy(repliteController.singleTemplate.body.bodyPrefix, repliteController.originPackage[bodySep+4:i])
 			// find the suffix
 			for j := i + 1; j < len(repliteController.originPackage); j++ {
 				if repliteController.originPackage[j] == 36 {
 					repliteController.singleTemplate.suffix = make([]byte, len(repliteController.originPackage)-j)
+					repliteController.singleTemplate.body.bodySufix = make([]byte, len(repliteController.originPackage)-j)
 					copy(repliteController.singleTemplate.suffix, repliteController.originPackage[j+1:])
+					copy(repliteController.singleTemplate.body.bodySufix, repliteController.originPackage[j+1:])
 					//originContent load
 					repliteController.singleTemplate.originContent = make([]byte, j-i-1)
 					copy(repliteController.singleTemplate.originContent, repliteController.originPackage[i+1:j])
+					repliteController.singleTemplate.body.bodyCommonLength = len(repliteController.singleTemplate.body.bodyPrefix) + len(repliteController.singleTemplate.body.bodySufix) - len(repliteController.singleTemplate.originContent)
 					reasonable = true
 					goto find
 				}
@@ -1364,4 +1396,27 @@ find:
 		}
 		io.Copy(file, bytes.NewBuffer(repliteController.originPackage))
 	}
+}
+
+var (
+	onceForBody sync.Once = sync.Once{}
+)
+
+func (repliteController *controller) readRequest(variable string) (request *http.Request, err error) {
+	onceForBody.Do(func() {
+		err = singleParse(repliteController.originPackage)
+	})
+	newRequest := singleRequest
+	actuallyLength := repliteController.singleTemplate.body.bodyCommonLength + len(variable)
+	newRequest.Body = io.NopCloser(io.LimitReader(bytes.NewReader([]byte(fmt.Sprintf("%s%s%s", repliteController.singleTemplate.body.bodyPrefix, variable, repliteController.singleTemplate.body.bodySufix))), int64(actuallyLength)))
+	newRequest.Header.Set("Content-Length", strconv.Itoa(actuallyLength))
+	return &newRequest, nil
+}
+
+func (repliteController *controller) ReadRequest(VariableParams string) (request *http.Request, err error) {
+	if !repliteController.singleTemplate.isBody {
+		return http.ReadRequest(bufio.NewReader(strings.NewReader(fmt.Sprintf("%s%s%s", string(repliteController.singleTemplate.prefix), VariableParams, string(repliteController.singleTemplate.suffix)))))
+	}
+	return repliteController.readRequest(VariableParams)
+
 }
