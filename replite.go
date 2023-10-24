@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"math"
 	"net"
 	"net/http"
@@ -1400,13 +1401,23 @@ find:
 
 var (
 	onceForBody sync.Once = sync.Once{}
+	passAll     sync.Cond = *sync.NewCond(&sync.RWMutex{})
+	initRequest int32     = 0
 )
 
 func (repliteController *controller) readRequest(variable string) (request *http.Request, err error) {
 	onceForBody.Do(func() {
 		err = singleParse(repliteController.originPackage)
+		atomic.CompareAndSwapInt32(&initRequest, 0, 1)
+		passAll.Broadcast()
 	})
+	for initRequest != 1 {
+		passAll.Wait()
+	}
 	newRequest := singleRequest
+	var newHeaders = http.Header{}
+	maps.Copy(newHeaders, singleRequest.Header)
+	newRequest.Header = newHeaders
 	actuallyLength := repliteController.singleTemplate.body.bodyCommonLength + len(variable)
 	newRequest.Body = io.NopCloser(io.LimitReader(bytes.NewReader([]byte(fmt.Sprintf("%s%s%s", repliteController.singleTemplate.body.bodyPrefix, variable, repliteController.singleTemplate.body.bodySufix))), int64(actuallyLength)))
 	newRequest.Header.Set("Content-Length", strconv.Itoa(actuallyLength))
