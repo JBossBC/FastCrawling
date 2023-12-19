@@ -202,17 +202,17 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 			repliteController.finalizeSignal <- fmt.Errorf("因网络原因导致重新建立连接多次,建议检查后台是否在线和所设线程的数量,防止被后台检测到和网络拥塞造成代理服务器崩溃:%s", err.Error())
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			r.Request.Retry()
+			repliteController.retryInterceptor(r.Request)
 			return
 		}
 		if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) || errors.Is(err, io.ErrUnexpectedEOF) {
 			repliteController.retryConn()
-			r.Request.Retry()
+			repliteController.retryInterceptor(r.Request)
 			return
 		}
 		if strings.Contains(err.Error(), "the connected party did not properly respond after a period of time") || strings.Contains(err.Error(), " connected host has failed to respond") {
 			repliteController.retryConn()
-			r.Request.Retry()
+			repliteController.retryInterceptor(r.Request)
 			return
 		}
 	})
@@ -227,8 +227,8 @@ func (repliteController *controller) buildCollector(proxyServer *ProxyServer, op
 	})
 
 	repliteController.c.OnResponse(func(r *colly.Response) {
-		if atomic.LoadInt32(&repliteController.requestMutex) == 1 || r.StatusCode != 200 {
-			r.Request.Retry()
+		if r.StatusCode != 200 {
+			repliteController.retryInterceptor(r.Request)
 			return
 		}
 		if atomic.LoadInt32(&repliteController.opTolerance) > maxToleranceTimesForNetwork {
@@ -378,7 +378,7 @@ func (repliteController *controller) cookieRecover(r *colly.Response) {
 	var flag string
 	fmt.Scanln(&flag)
 	if strings.ToLower(flag) == "true" {
-		r.Request.Retry()
+		repliteController.retryInterceptor(r.Request)
 	} else {
 		//update the tremble factor
 		repliteController.contentTremble.MinToleranceLength = repliteController.contentTremble.CurTrembleValue
@@ -462,6 +462,19 @@ func (repliteController *controller) recoverPersistence() {
 	}
 	io.Copy(paramsFile, bytes.NewBuffer(paramsInfoBys))
 	fmt.Println("-------------------------------------------未爬取的数据备份成功,可使用--fixup参数修复------------------------------------------------------------------------")
+}
+func (repliteController *controller) retryInterceptor(request *colly.Request) {
+	requestMutex := atomic.LoadInt32(&repliteController.requestMutex)
+	cTimes := 0
+	for requestMutex == 1 {
+		time.Sleep(smoothRequest)
+		if cTimes >= 10 {
+			requestMutex = atomic.LoadInt32(&repliteController.requestMutex)
+			cTimes = 0
+		}
+		cTimes++
+	}
+	request.Retry()
 }
 
 func (repliteController *controller) saveMetrics() {
@@ -1360,20 +1373,25 @@ func (repliteController *controller) requestTemplateHandle() {
 				repliteController.singleTemplate.isBody = true
 			}
 			repliteController.singleTemplate.prefix = make([]byte, i)
-			repliteController.singleTemplate.body.bodyPrefix = make([]byte, i-bodySep-4)
+			if repliteController.singleTemplate.isBody {
+				repliteController.singleTemplate.body.bodyPrefix = make([]byte, i-bodySep-4)
+				copy(repliteController.singleTemplate.body.bodyPrefix, repliteController.originPackage[bodySep+4:i])
+			}
 			copy(repliteController.singleTemplate.prefix, repliteController.originPackage[:i])
-			copy(repliteController.singleTemplate.body.bodyPrefix, repliteController.originPackage[bodySep+4:i])
+
 			// find the suffix
 			for j := i + 1; j < len(repliteController.originPackage); j++ {
 				if repliteController.originPackage[j] == 36 {
 					repliteController.singleTemplate.suffix = make([]byte, len(repliteController.originPackage)-j)
-					repliteController.singleTemplate.body.bodySufix = make([]byte, len(repliteController.originPackage)-j)
 					copy(repliteController.singleTemplate.suffix, repliteController.originPackage[j+1:])
-					copy(repliteController.singleTemplate.body.bodySufix, repliteController.originPackage[j+1:])
 					//originContent load
 					repliteController.singleTemplate.originContent = make([]byte, j-i-1)
 					copy(repliteController.singleTemplate.originContent, repliteController.originPackage[i+1:j])
-					repliteController.singleTemplate.body.bodyCommonLength = len(repliteController.singleTemplate.body.bodyPrefix) + len(repliteController.singleTemplate.body.bodySufix) - len(repliteController.singleTemplate.originContent)
+					if repliteController.singleTemplate.isBody {
+						repliteController.singleTemplate.body.bodySufix = make([]byte, len(repliteController.originPackage)-j)
+						copy(repliteController.singleTemplate.body.bodySufix, repliteController.originPackage[j+1:])
+						repliteController.singleTemplate.body.bodyCommonLength = len(repliteController.singleTemplate.body.bodyPrefix) + len(repliteController.singleTemplate.body.bodySufix) - len(repliteController.singleTemplate.originContent)
+					}
 					reasonable = true
 					goto find
 				}
