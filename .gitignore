@@ -31,3 +31,10 @@ resource.syso
 replite.exe
 
 replite_trace.exe
+
+
+.idea/*
+
+test/*
+
+testData/*
